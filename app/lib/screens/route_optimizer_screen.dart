@@ -1,46 +1,8 @@
-import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:http/http.dart' as http;
+import 'package:app/services/routing_service.dart';
 import 'package:latlong2/latlong.dart';
-
-/// Servicio para obtener la ruta navegable utilizando la API pública de OSRM.
-class RoutingService {
-  Future<Map<String, dynamic>?> getRoute(LatLng origin, LatLng destination) async {
-    final url = Uri.parse(
-      'https://router.project-osrm.org/route/v1/driving/'
-      '${origin.longitude},${origin.latitude};${destination.longitude},${destination.latitude}'
-      '?overview=full&geometries=geojson',
-    );
-
-    try {
-      final response = await http.get(url);
-      if (response.statusCode == 200) {
-        final data = json.decode(response.body);
-        if (data['routes'] != null && (data['routes'] as List).isNotEmpty) {
-          final route = data['routes'][0];
-          final coordinates = route['geometry']['coordinates'] as List;
-          final points = coordinates
-              .map((coord) => LatLng(coord[1].toDouble(), coord[0].toDouble()))
-              .toList();
-
-          final double distanceMeters = (route['distance'] as num).toDouble();
-          final double durationSeconds = (route['duration'] as num).toDouble();
-
-          return {
-            'points': points,
-            'distanceKm': distanceMeters / 1000,
-            'durationMin': durationSeconds / 60,
-          };
-        }
-      }
-    } catch (e) {
-      debugPrint('Error en RoutingService: $e');
-    }
-    return null;
-  }
-}
 
 class RouteOptimizerScreen extends StatefulWidget {
   const RouteOptimizerScreen({super.key});
@@ -114,7 +76,6 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
       if (!mounted) return;
       setState(() {
         _currentLocation = userLatLng;
-        _origin = userLatLng;
         _isLoadingLocation = false;
       });
 
@@ -129,7 +90,7 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
     if (!mounted) return;
     setState(() {
       _isLoadingLocation = false;
-      _origin = _defaultCenter;
+      _currentLocation = _defaultCenter;
     });
     _mapController.move(_defaultCenter, 13.0);
   }
@@ -137,7 +98,7 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
   /// Lógica al presionar sobre el mapa.
   void _handleTap(TapPosition tapPosition, LatLng point) {
     if (_origin == null || (_origin != null && _destination != null)) {
-      // Caso 1 o 3: Primer toque o reinicio de selección
+      // Primer toque o reinicio de selección: se define el origen.
       setState(() {
         _origin = point;
         _destination = null;
@@ -146,7 +107,7 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
         _routeDurationMin = null;
       });
     } else if (_origin != null && _destination == null) {
-      // Caso 2: Segundo toque (Destino)
+      // Segundo toque: se define el destino y se recalcula la ruta.
       setState(() => _destination = point);
       _calculateRoute();
     }
@@ -158,18 +119,26 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
 
     setState(() => _isFetchingRoute = true);
 
-    final result = await _routingService.getRoute(_origin!, _destination!);
+    try {
+      final result = await _routingService.getRoute(
+        origin: _origin!,
+        destination: _destination!,
+      );
 
-    if (!mounted) return;
+      if (!mounted) return;
 
-    if (result != null) {
       setState(() {
-        _routePoints = result['points'] as List<LatLng>;
-        _routeDistanceKm = result['distanceKm'] as double;
-        _routeDurationMin = result['durationMin'] as double;
+        _routePoints = result.points;
+        _routeDistanceKm = result.distanceKm;
+        _routeDurationMin = result.durationMinutes;
         _isFetchingRoute = false;
       });
-    } else {
+    } on RoutingException catch (e) {
+      if (!mounted) return;
+      setState(() => _isFetchingRoute = false);
+      _showSnackBar(e.message);
+    } catch (e) {
+      if (!mounted) return;
       setState(() => _isFetchingRoute = false);
       _showSnackBar('No se pudo calcular la ruta entre los puntos.');
     }
@@ -178,7 +147,7 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
   /// Restablece la selección de origen y destino.
   void _clearRoute() {
     setState(() {
-      _origin = _currentLocation;
+      _origin = null;
       _destination = null;
       _routePoints = [];
       _routeDistanceKm = null;
@@ -246,6 +215,17 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
                 ),
               MarkerLayer(
                 markers: [
+                  if (_currentLocation != null)
+                    Marker(
+                      point: _currentLocation!,
+                      width: 36.0,
+                      height: 36.0,
+                      child: const Icon(
+                        Icons.my_location,
+                        color: Colors.blue,
+                        size: 28.0,
+                      ),
+                    ),
                   if (_origin != null)
                     Marker(
                       point: _origin!,

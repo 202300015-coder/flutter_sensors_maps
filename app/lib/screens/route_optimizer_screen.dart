@@ -1,22 +1,47 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
-import 'package:latlong2/latlong.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:http/http.dart' as http;
+import 'package:latlong2/latlong.dart';
 
-import '../services/routing_service.dart';
+/// Servicio para obtener la ruta navegable utilizando la API pública de OSRM.
+class RoutingService {
+  Future<Map<String, dynamic>?> getRoute(LatLng origin, LatLng destination) async {
+    final url = Uri.parse(
+      'https://router.project-osrm.org/route/v1/driving/'
+      '${origin.longitude},${origin.latitude};${destination.longitude},${destination.latitude}'
+      '?overview=full&geometries=geojson',
+    );
 
-/// Pantalla de optimización de rutas.
-///
-/// Flujo:
-/// 1. Al abrir, solicita permisos de GPS y centra el mapa en la
-///    ubicación actual del usuario.
-/// 2. El usuario toca el mapa:
-///    - Sin origen -> el toque fija el Origen.
-///    - Con origen y sin destino -> el toque fija el Destino y
-///      dispara el cálculo de ruta con OSRM.
-///    - Con origen y destino -> el toque reinicia la selección
-///      (limpia todo) y no fija nada hasta el siguiente toque.
-/// 3. Botones: "Usar mi ubicación actual como Origen" y "Limpiar selección".
+    try {
+      final response = await http.get(url);
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        if (data['routes'] != null && (data['routes'] as List).isNotEmpty) {
+          final route = data['routes'][0];
+          final coordinates = route['geometry']['coordinates'] as List;
+          final points = coordinates
+              .map((coord) => LatLng(coord[1].toDouble(), coord[0].toDouble()))
+              .toList();
+
+          final double distanceMeters = (route['distance'] as num).toDouble();
+          final double durationSeconds = (route['duration'] as num).toDouble();
+
+          return {
+            'points': points,
+            'distanceKm': distanceMeters / 1000,
+            'durationMin': durationSeconds / 60,
+          };
+        }
+      }
+    } catch (e) {
+      debugPrint('Error en RoutingService: $e');
+    }
+    return null;
+  }
+}
+
 class RouteOptimizerScreen extends StatefulWidget {
   const RouteOptimizerScreen({super.key});
 
@@ -25,316 +50,222 @@ class RouteOptimizerScreen extends StatefulWidget {
 }
 
 class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
-  final RoutingService _routingService = RoutingService();
   final MapController _mapController = MapController();
+  final RoutingService _routingService = RoutingService();
 
-  // Puntos seleccionados por el usuario.
+  LatLng? _currentLocation;
   LatLng? _origin;
   LatLng? _destination;
 
-  // Ruta calculada.
   List<LatLng> _routePoints = [];
-  RouteResult? _routeResult;
+  double? _routeDistanceKm;
+  double? _routeDurationMin;
 
-  // Última posición GPS conocida (para el botón "usar mi ubicación").
-  LatLng? _currentUserLocation;
+  bool _isLoadingLocation = true;
+  bool _isFetchingRoute = false;
 
-  // Estados de carga.
-  bool _isLocating = true;
-  bool _isRoutingLoading = false;
-
-  // Flag para saber si el mapa ya terminó su primer frame
-  // (evita mover la cámara antes de que esté listo).
-  bool _mapReady = false;
-
-  String? _errorMessage;
-
-  static const LatLng _fallbackCenter = LatLng(19.4326, -99.1332); // CDMX
+  // Ubicación por defecto (Ciudad de México) si falla el GPS
+  final LatLng _defaultCenter = const LatLng(19.432608, -99.133208);
 
   @override
   void initState() {
     super.initState();
-    // Se ejecuta después de que el primer frame se haya renderizado,
-    // garantizando que el MapController ya esté "attached" al widget
-    // FlutterMap antes de intentar mover la cámara.
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _mapReady = true;
-      _initLocation();
-    });
+    _initLocation();
   }
 
-  // ---------------------------------------------------------------------
-  // Geolocalización
-  // ---------------------------------------------------------------------
-
-  /// Solicita permisos de ubicación y obtiene la posición actual,
-  /// centrando el mapa y fijándola como Origen si aún no hay uno.
+  /// Gestiona los permisos e inicializa la posición actual del usuario.
   Future<void> _initLocation() async {
-    setState(() {
-      _isLocating = true;
-      _errorMessage = null;
-    });
+    setState(() => _isLoadingLocation = true);
 
-    try {
-      final position = await _requestLocationAndGetPosition();
-      final userLocation = LatLng(position.latitude, position.longitude);
+    bool serviceEnabled;
+    LocationPermission permission;
 
-      setState(() {
-        _currentUserLocation = userLocation;
-        // Solo fijamos el origen automáticamente si el usuario aún
-        // no ha marcado nada manualmente en el mapa.
-        _origin ??= userLocation;
-      });
-
-      _moveMapSafely(userLocation, 16);
-    } on LocationPermissionException catch (e) {
-      _showPermissionSnackBar(e.message);
-    } catch (e) {
-      setState(() {
-        _errorMessage = 'No se pudo obtener tu ubicación: $e';
-      });
-    } finally {
-      if (mounted) {
-        setState(() => _isLocating = false);
-      }
-    }
-  }
-
-  /// Paso a paso: verifica servicio de ubicación activo, solicita
-  /// el permiso explícitamente con requestPermission(), y luego
-  /// obtiene la posición actual con getCurrentPosition().
-  Future<Position> _requestLocationAndGetPosition() async {
-    // 1. ¿Está el servicio de ubicación (GPS) encendido en el dispositivo?
-    final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    serviceEnabled = await Geolocator.isLocationServiceEnabled();
     if (!serviceEnabled) {
-      throw LocationPermissionException(
-        'El GPS está desactivado. Actívalo en la configuración del dispositivo.',
-      );
+      _showSnackBar('Los servicios de ubicación están desactivados.');
+      _useFallbackLocation();
+      return;
     }
 
-    // 2. Solicita el permiso de forma explícita (dispara el diálogo
-    // nativo de Android/iOS si aún no se ha concedido).
-    LocationPermission permission = await Geolocator.requestPermission();
-
+    permission = await Geolocator.checkPermission();
     if (permission == LocationPermission.denied) {
-      throw LocationPermissionException(
-        'Permiso de ubicación denegado. No se puede centrar el mapa en tu posición.',
-      );
+      permission = await Geolocator.requestPermission();
+      if (permission == LocationPermission.denied) {
+        _showSnackBar('Permiso de ubicación denegado.');
+        _useFallbackLocation();
+        return;
+      }
     }
 
     if (permission == LocationPermission.deniedForever) {
-      throw LocationPermissionException(
-        'El permiso de ubicación fue denegado permanentemente. '
-        'Habilítalo manualmente desde los ajustes de la app.',
-      );
+      _showSnackBar('Los permisos de ubicación están denegados permanentemente.');
+      _useFallbackLocation();
+      return;
     }
 
-    // 3. Ya con permiso concedido (whileInUse o always), obtenemos
-    // la posición actual del dispositivo.
-    return Geolocator.getCurrentPosition(
-      locationSettings: const LocationSettings(
-        accuracy: LocationAccuracy.high,
-      ),
-    );
-  }
-
-  /// Mueve la cámara del mapa solo si el controller ya está listo
-  /// (evita excepciones o congelamientos si se llama demasiado pronto).
-  void _moveMapSafely(LatLng target, double zoom) {
-    if (!_mapReady) return;
     try {
-      _mapController.move(target, zoom);
-    } catch (_) {
-      // Si el controller aún no está attached, se ignora silenciosamente;
-      // el usuario puede recentrar manualmente con el FAB.
-    }
-  }
-
-  void _showPermissionSnackBar(String message) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(message),
-        duration: const Duration(seconds: 5),
-        action: SnackBarAction(
-          label: 'Reintentar',
-          onPressed: _initLocation,
+      final position = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
         ),
-      ),
-    );
-  }
+      );
+      final userLatLng = LatLng(position.latitude, position.longitude);
 
-  /// Botón: "Usar mi ubicación actual como Origen".
-  /// Si ya tenemos una posición GPS conocida, la usa directamente;
-  /// si no, la solicita de nuevo.
-  Future<void> _useCurrentLocationAsOrigin() async {
-    if (_currentUserLocation == null) {
-      await _initLocation();
-      if (_currentUserLocation == null) return; // no se pudo obtener
+      if (!mounted) return;
+      setState(() {
+        _currentLocation = userLatLng;
+        _origin = userLatLng;
+        _isLoadingLocation = false;
+      });
+
+      _mapController.move(userLatLng, 15.0);
+    } catch (e) {
+      _showSnackBar('Error al obtener la ubicación actual.');
+      _useFallbackLocation();
     }
-
-    setState(() {
-      _origin = _currentUserLocation;
-      _destination = null;
-      _routePoints = [];
-      _routeResult = null;
-      _errorMessage = null;
-    });
-
-    _moveMapSafely(_currentUserLocation!, 16);
   }
 
-  // ---------------------------------------------------------------------
-  // Interacción con el mapa (toques)
-  // ---------------------------------------------------------------------
-
-  /// Maneja el toque sobre el mapa según las 3 reglas solicitadas.
-  void _handleMapTap(TapPosition tapPosition, LatLng point) {
+  void _useFallbackLocation() {
+    if (!mounted) return;
     setState(() {
-      _errorMessage = null;
+      _isLoadingLocation = false;
+      _origin = _defaultCenter;
+    });
+    _mapController.move(_defaultCenter, 13.0);
+  }
 
-      if (_origin == null) {
-        // Regla 1: no hay origen -> este toque lo fija.
+  /// Lógica al presionar sobre el mapa.
+  void _handleTap(TapPosition tapPosition, LatLng point) {
+    if (_origin == null || (_origin != null && _destination != null)) {
+      // Caso 1 o 3: Primer toque o reinicio de selección
+      setState(() {
         _origin = point;
-      } else if (_destination == null) {
-        // Regla 2: hay origen pero no destino -> este toque fija destino
-        // y se dispara el cálculo de ruta (fuera del setState).
-        _destination = point;
-      } else {
-        // Regla 3: ya existen ambos -> se reinicia la selección.
-        _origin = null;
         _destination = null;
         _routePoints = [];
-        _routeResult = null;
-      }
-    });
-
-    if (_origin != null && _destination != null && _routePoints.isEmpty) {
+        _routeDistanceKm = null;
+        _routeDurationMin = null;
+      });
+    } else if (_origin != null && _destination == null) {
+      // Caso 2: Segundo toque (Destino)
+      setState(() => _destination = point);
       _calculateRoute();
     }
   }
 
-  /// Botón: "Limpiar selección".
-  void _clearSelection() {
-    setState(() {
-      _origin = null;
-      _destination = null;
-      _routePoints = [];
-      _routeResult = null;
-      _errorMessage = null;
-    });
-  }
-
-  // ---------------------------------------------------------------------
-  // Cálculo de ruta (OSRM)
-  // ---------------------------------------------------------------------
-
+  /// Llama al servicio de ruteo y traza la Polyline.
   Future<void> _calculateRoute() async {
     if (_origin == null || _destination == null) return;
 
-    setState(() {
-      _isRoutingLoading = true;
-      _errorMessage = null;
-    });
+    setState(() => _isFetchingRoute = true);
 
-    try {
-      final result = await _routingService.getRoute(
-        origin: _origin!,
-        destination: _destination!,
-        profile: 'driving',
-      );
+    final result = await _routingService.getRoute(_origin!, _destination!);
 
-      setState(() {
-        _routePoints = result.points;
-        _routeResult = result;
-      });
+    if (!mounted) return;
 
-      if (_routePoints.isNotEmpty) {
-        _mapController.fitCamera(
-          CameraFit.coordinates(
-            coordinates: _routePoints,
-            padding: const EdgeInsets.all(48),
-          ),
-        );
-      }
-    } on RoutingException catch (e) {
+    if (result != null) {
       setState(() {
-        _errorMessage = 'No se pudo calcular la ruta: ${e.message}';
-        _routePoints = [];
-        _routeResult = null;
+        _routePoints = result['points'] as List<LatLng>;
+        _routeDistanceKm = result['distanceKm'] as double;
+        _routeDurationMin = result['durationMin'] as double;
+        _isFetchingRoute = false;
       });
-    } catch (e) {
-      setState(() {
-        _errorMessage = 'Error de red al consultar OSRM. Verifica tu conexión.';
-        _routePoints = [];
-        _routeResult = null;
-      });
-    } finally {
-      if (mounted) {
-        setState(() => _isRoutingLoading = false);
-      }
+    } else {
+      setState(() => _isFetchingRoute = false);
+      _showSnackBar('No se pudo calcular la ruta entre los puntos.');
     }
   }
 
-  // ---------------------------------------------------------------------
-  // UI
-  // ---------------------------------------------------------------------
+  /// Restablece la selección de origen y destino.
+  void _clearRoute() {
+    setState(() {
+      _origin = _currentLocation;
+      _destination = null;
+      _routePoints = [];
+      _routeDistanceKm = null;
+      _routeDurationMin = null;
+    });
+    if (_currentLocation != null) {
+      _mapController.move(_currentLocation!, 15.0);
+    }
+  }
+
+  /// Centra el mapa en la posición actual del GPS.
+  void _recenterToCurrentLocation() {
+    if (_currentLocation != null) {
+      _mapController.move(_currentLocation!, 15.0);
+    } else {
+      _initLocation();
+    }
+  }
+
+  void _showSnackBar(String text) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(text), duration: const Duration(seconds: 3)),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
+    final initialCenter = _currentLocation ?? _defaultCenter;
+
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Optimizador de Rutas'),
+        title: const Text('Optimizador de Ruta'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.clear_all),
+            tooltip: 'Limpiar Ruta',
+            onPressed: _clearRoute,
+          ),
+        ],
       ),
       body: Stack(
         children: [
-          // Mapa interactivo.
           FlutterMap(
             mapController: _mapController,
             options: MapOptions(
-              initialCenter: _fallbackCenter,
-              initialZoom: 12,
-              onTap: _handleMapTap,
+              initialCenter: initialCenter,
+              initialZoom: 14.0,
+              onTap: _handleTap,
             ),
             children: [
               TileLayer(
                 urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                userAgentPackageName: 'com.example.flutter_sensors_maps',
+                userAgentPackageName: 'com.example.route_optimizer',
               ),
-
               if (_routePoints.isNotEmpty)
                 PolylineLayer(
                   polylines: [
                     Polyline(
                       points: _routePoints,
-                      strokeWidth: 5,
-                      color: Colors.blueAccent,
+                      strokeWidth: 5.0,
+                      color: Colors.blue,
                     ),
                   ],
                 ),
-
               MarkerLayer(
                 markers: [
                   if (_origin != null)
                     Marker(
                       point: _origin!,
-                      width: 44,
-                      height: 44,
+                      width: 40.0,
+                      height: 40.0,
                       child: const Icon(
-                        Icons.trip_origin,
-                        color: Colors.blue,
-                        size: 32,
+                        Icons.location_on,
+                        color: Colors.green,
+                        size: 40.0,
                       ),
                     ),
                   if (_destination != null)
                     Marker(
                       point: _destination!,
-                      width: 44,
-                      height: 44,
+                      width: 40.0,
+                      height: 40.0,
                       child: const Icon(
-                        Icons.flag,
+                        Icons.location_on,
                         color: Colors.red,
-                        size: 32,
+                        size: 40.0,
                       ),
                     ),
                 ],
@@ -342,276 +273,119 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
             ],
           ),
 
-          // Banner superior con instrucciones dinámicas.
-          Positioned(
-            top: 12,
-            left: 12,
-            right: 12,
-            child: _InstructionBanner(
-              isLocating: _isLocating,
-              hasOrigin: _origin != null,
-              hasDestination: _destination != null,
-            ),
-          ),
-
-          // Indicador de carga (GPS o cálculo de ruta).
-          if (_isLocating || _isRoutingLoading)
-            const Positioned.fill(
-              child: IgnorePointer(
-                child: Center(child: _LoadingBadge()),
+          // Indicador de estado de carga inicial de GPS
+          if (_isLoadingLocation)
+            Container(
+              color: Colors.black26,
+              child: const Center(
+                child: Card(
+                  child: Padding(
+                    padding: EdgeInsets.all(16.0),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        CircularProgressIndicator(),
+                        SizedBox(width: 16),
+                        Text('Obteniendo ubicación...'),
+                      ],
+                    ),
+                  ),
+                ),
               ),
             ),
 
-          // Banner de error.
-          if (_errorMessage != null)
-            Positioned(
-              bottom: _routeResult != null ? 170 : 90,
+          // Indicador de estado de carga de la ruta
+          if (_isFetchingRoute)
+            const Positioned(
+              top: 16,
               left: 16,
               right: 16,
-              child: _ErrorBanner(message: _errorMessage!),
+              child: Card(
+                child: Padding(
+                  padding: EdgeInsets.symmetric(vertical: 12.0, horizontal: 16.0),
+                  child: Row(
+                    children: [
+                      SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2.5),
+                      ),
+                      SizedBox(width: 16),
+                      Text('Trazando ruta...'),
+                    ],
+                  ),
+                ),
+              ),
             ),
 
-          // Tarjeta con distancia y tiempo estimado.
-          if (_routeResult != null)
+          // Card informativo con distancia y duración estimada
+          if (_routeDistanceKm != null && _routeDurationMin != null && !_isFetchingRoute)
             Positioned(
-              bottom: 90,
+              top: 16,
               left: 16,
               right: 16,
-              child: _RouteInfoCard(result: _routeResult!),
-            ),
-
-          // Barra inferior con los botones de acción.
-          Positioned(
-            bottom: 16,
-            left: 16,
-            right: 16,
-            child: Row(
-              children: [
-                Expanded(
-                  child: ElevatedButton.icon(
-                    onPressed: _isLocating ? null : _useCurrentLocationAsOrigin,
-                    icon: const Icon(Icons.my_location, size: 18),
-                    label: const Text('Usar mi ubicación'),
-                    style: ElevatedButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(vertical: 12),
-                    ),
+              child: Card(
+                elevation: 4,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.all(16.0),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceAround,
+                    children: [
+                      Row(
+                        children: [
+                          const Icon(Icons.straighten, color: Colors.blue),
+                          const SizedBox(width: 8),
+                          Text(
+                            '${_routeDistanceKm!.toStringAsFixed(2)} km',
+                            style: const TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 16,
+                            ),
+                          ),
+                        ],
+                      ),
+                      Row(
+                        children: [
+                          const Icon(Icons.timer, color: Colors.orange),
+                          const SizedBox(width: 8),
+                          Text(
+                            '${_routeDurationMin!.toStringAsFixed(0)} min',
+                            style: const TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 16,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
                   ),
                 ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: (_origin != null || _destination != null)
-                        ? _clearSelection
-                        : null,
-                    icon: const Icon(Icons.clear, size: 18),
-                    label: const Text('Limpiar selección'),
-                    style: OutlinedButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(vertical: 12),
-                    ),
-                  ),
-                ),
-              ],
+              ),
             ),
+        ],
+      ),
+      floatingActionButton: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          FloatingActionButton(
+            heroTag: 'recenter_btn',
+            onPressed: _recenterToCurrentLocation,
+            tooltip: 'Mi Ubicación',
+            child: const Icon(Icons.my_location),
+          ),
+          const SizedBox(height: 10),
+          FloatingActionButton(
+            heroTag: 'clear_btn',
+            backgroundColor: Colors.redAccent,
+            onPressed: _clearRoute,
+            tooltip: 'Limpiar Ruta',
+            child: const Icon(Icons.delete_outline),
           ),
         ],
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _isLocating
-            ? null
-            : () {
-                if (_currentUserLocation != null) {
-                  _moveMapSafely(_currentUserLocation!, 16);
-                } else {
-                  _initLocation();
-                }
-              },
-        tooltip: 'Centrar en mi ubicación',
-        child: _isLocating
-            ? const SizedBox(
-                width: 20,
-                height: 20,
-                child: CircularProgressIndicator(
-                  strokeWidth: 2,
-                  color: Colors.white,
-                ),
-              )
-            : const Icon(Icons.center_focus_strong),
-      ),
-    );
-  }
-}
-
-// ---------------------------------------------------------------------
-// Excepciones
-// ---------------------------------------------------------------------
-
-class LocationPermissionException implements Exception {
-  final String message;
-  LocationPermissionException(this.message);
-}
-
-// ---------------------------------------------------------------------
-// Widgets auxiliares de UI
-// ---------------------------------------------------------------------
-
-class _InstructionBanner extends StatelessWidget {
-  final bool isLocating;
-  final bool hasOrigin;
-  final bool hasDestination;
-
-  const _InstructionBanner({
-    required this.isLocating,
-    required this.hasOrigin,
-    required this.hasDestination,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    String message;
-    IconData icon;
-    Color color;
-
-    if (isLocating) {
-      message = 'Solicitando permiso y obteniendo tu ubicación...';
-      icon = Icons.gps_fixed;
-      color = Colors.blueGrey;
-    } else if (!hasOrigin) {
-      message = 'Toca el mapa para marcar el ORIGEN';
-      icon = Icons.trip_origin;
-      color = Colors.blue;
-    } else if (!hasDestination) {
-      message = 'Origen listo. Toca el mapa para marcar el DESTINO';
-      icon = Icons.flag;
-      color = Colors.red;
-    } else {
-      message = 'Ruta trazada. Toca de nuevo para reiniciar la selección.';
-      icon = Icons.check_circle;
-      color = Colors.green;
-    }
-
-    return Material(
-      elevation: 3,
-      borderRadius: BorderRadius.circular(10),
-      color: Colors.white,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        child: Row(
-          children: [
-            Icon(icon, color: color, size: 20),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Text(
-                message,
-                style: TextStyle(color: color, fontWeight: FontWeight.w500),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _LoadingBadge extends StatelessWidget {
-  const _LoadingBadge();
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Colors.black87,
-        borderRadius: BorderRadius.circular(12),
-      ),
-      child: const CircularProgressIndicator(
-        color: Colors.white,
-        strokeWidth: 3,
-      ),
-    );
-  }
-}
-
-class _ErrorBanner extends StatelessWidget {
-  final String message;
-
-  const _ErrorBanner({required this.message});
-
-  @override
-  Widget build(BuildContext context) {
-    return Material(
-      elevation: 4,
-      borderRadius: BorderRadius.circular(10),
-      color: Colors.red.shade50,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        child: Row(
-          children: [
-            const Icon(Icons.error_outline, color: Colors.red, size: 20),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Text(message, style: const TextStyle(color: Colors.red)),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _RouteInfoCard extends StatelessWidget {
-  final RouteResult result;
-
-  const _RouteInfoCard({required this.result});
-
-  @override
-  Widget build(BuildContext context) {
-    return Material(
-      elevation: 6,
-      borderRadius: BorderRadius.circular(14),
-      color: Colors.white,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.spaceAround,
-          children: [
-            _InfoColumn(
-              icon: Icons.straighten,
-              value: '${result.distanceKm.toStringAsFixed(2)} km',
-              label: 'Distancia',
-            ),
-            Container(width: 1, height: 36, color: Colors.grey.shade300),
-            _InfoColumn(
-              icon: Icons.access_time,
-              value: '${result.durationMinutes.toStringAsFixed(0)} min',
-              label: 'Tiempo estimado',
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _InfoColumn extends StatelessWidget {
-  final IconData icon;
-  final String value;
-  final String label;
-
-  const _InfoColumn({
-    required this.icon,
-    required this.value,
-    required this.label,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      children: [
-        Icon(icon, color: Colors.blueAccent, size: 22),
-        const SizedBox(height: 4),
-        Text(value, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-        Text(label, style: const TextStyle(fontSize: 12, color: Colors.grey)),
-      ],
     );
   }
 }

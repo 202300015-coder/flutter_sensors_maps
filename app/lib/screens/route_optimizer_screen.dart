@@ -32,35 +32,36 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
   @override
   void initState() {
     super.initState();
-    _initLocation();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _initLocation();
+    });
   }
 
   /// Gestiona los permisos e inicializa la posición actual del usuario.
   Future<void> _initLocation() async {
     setState(() => _isLoadingLocation = true);
 
-    bool serviceEnabled;
-    LocationPermission permission;
-
-    serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    final bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
     if (!serviceEnabled) {
-      _showSnackBar('Los servicios de ubicación están desactivados.');
+      _showSnackBar('GPS apagado: activa los servicios de ubicación.');
+      await Geolocator.openLocationSettings();
       _useFallbackLocation();
       return;
     }
 
-    permission = await Geolocator.checkPermission();
+    LocationPermission permission = await Geolocator.checkPermission();
     if (permission == LocationPermission.denied) {
       permission = await Geolocator.requestPermission();
       if (permission == LocationPermission.denied) {
-        _showSnackBar('Permiso de ubicación denegado.');
+        _showSnackBar('Permiso de ubicación denegado por el usuario.');
         _useFallbackLocation();
         return;
       }
     }
 
     if (permission == LocationPermission.deniedForever) {
-      _showSnackBar('Los permisos de ubicación están denegados permanentemente.');
+      _showSnackBar('Permiso denegado permanentemente. Redirigiendo a Ajustes...');
+      await Geolocator.openAppSettings();
       _useFallbackLocation();
       return;
     }
@@ -72,6 +73,7 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
         ),
       );
       final userLatLng = LatLng(position.latitude, position.longitude);
+      debugPrint('UBICACIÓN REAL ENCONTRADA: ${position.latitude}, ${position.longitude}');
 
       if (!mounted) return;
       setState(() {
@@ -81,7 +83,7 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
 
       _mapController.move(userLatLng, 15.0);
     } catch (e) {
-      _showSnackBar('Error al obtener la ubicación actual.');
+      _showSnackBar('Error GPS: $e');
       _useFallbackLocation();
     }
   }
@@ -182,6 +184,11 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
       appBar: AppBar(
         title: const Text('Optimizador de Ruta'),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.my_location),
+            tooltip: 'Probar GPS',
+            onPressed: _initLocation,
+          ),
           IconButton(
             icon: const Icon(Icons.clear_all),
             tooltip: 'Limpiar Ruta',

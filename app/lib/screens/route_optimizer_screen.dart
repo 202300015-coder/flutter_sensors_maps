@@ -1,8 +1,9 @@
 import 'dart:async';
+
+import 'package:app/services/routing_service.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:app/services/routing_service.dart';
 import 'package:latlong2/latlong.dart';
 
 class RouteOptimizerScreen extends StatefulWidget {
@@ -24,30 +25,26 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
   double? _routeDistanceKm;
   double? _routeDurationMin;
 
-  bool _isLoadingLocation = true;
   bool _isFetchingRoute = false;
 
-  // Ubicación por defecto (Ciudad de México) si falla el GPS
   final LatLng _defaultCenter = const LatLng(19.432608, -99.133208);
 
-  @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _initLocation();
-    });
+  void _showSnackBar(String text) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(text), duration: const Duration(seconds: 4)),
+    );
   }
 
-  /// Gestiona los permisos e inicializa la posición actual del usuario.
+  /// Pide ubicación únicamente cuando el usuario presiona el botón.
   Future<void> _initLocation() async {
-    setState(() => _isLoadingLocation = true);
+    _showSnackBar('Buscando señal de GPS...');
 
     try {
       final bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
       if (!serviceEnabled) {
-        _showSnackBar('GPS apagado: activa los servicios de ubicación.');
+        _showSnackBar('El GPS está apagado en tu teléfono.');
         unawaited(Geolocator.openLocationSettings());
-        _useFallbackLocation();
         return;
       }
 
@@ -55,16 +52,14 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
       if (permission == LocationPermission.denied) {
         permission = await Geolocator.requestPermission();
         if (permission == LocationPermission.denied) {
-          _showSnackBar('Permiso de ubicación denegado por el usuario.');
-          _useFallbackLocation();
+          _showSnackBar('Permiso de GPS denegado.');
           return;
         }
       }
 
       if (permission == LocationPermission.deniedForever) {
-        _showSnackBar('Permiso denegado permanentemente. Ve a Ajustes.');
+        _showSnackBar('Permiso denegado permanentemente en Android.');
         unawaited(Geolocator.openAppSettings());
-        _useFallbackLocation();
         return;
       }
 
@@ -77,34 +72,24 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
       );
 
       final userLatLng = LatLng(position.latitude, position.longitude);
-      debugPrint('UBICACIÓN REAL ENCONTRADA: ${position.latitude}, ${position.longitude}');
+      debugPrint(
+        'UBICACIÓN REAL ENCONTRADA: ${position.latitude}, ${position.longitude}',
+      );
 
       if (!mounted) return;
       setState(() {
         _currentLocation = userLatLng;
-        _isLoadingLocation = false;
       });
 
       _mapController.move(userLatLng, 15.0);
+      _showSnackBar('¡Ubicación encontrada!');
     } catch (e) {
-      _showSnackBar('Error GPS: $e');
-      _useFallbackLocation();
+      _showSnackBar('Error obteniendo GPS: $e');
     }
   }
 
-  void _useFallbackLocation() {
-    if (!mounted) return;
-    setState(() {
-      _isLoadingLocation = false;
-      _currentLocation = _defaultCenter;
-    });
-    _mapController.move(_defaultCenter, 13.0);
-  }
-
-  /// Lógica al presionar sobre el mapa.
   void _handleTap(TapPosition tapPosition, LatLng point) {
     if (_origin == null || (_origin != null && _destination != null)) {
-      // Primer toque o reinicio de selección: se define el origen.
       setState(() {
         _origin = point;
         _destination = null;
@@ -113,13 +98,11 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
         _routeDurationMin = null;
       });
     } else if (_origin != null && _destination == null) {
-      // Segundo toque: se define el destino y se recalcula la ruta.
       setState(() => _destination = point);
       _calculateRoute();
     }
   }
 
-  /// Llama al servicio de ruteo y traza la Polyline.
   Future<void> _calculateRoute() async {
     if (_origin == null || _destination == null) return;
 
@@ -132,7 +115,6 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
       );
 
       if (!mounted) return;
-
       setState(() {
         _routePoints = result.points;
         _routeDistanceKm = result.distanceKm;
@@ -143,14 +125,13 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
       if (!mounted) return;
       setState(() => _isFetchingRoute = false);
       _showSnackBar(e.message);
-    } catch (e) {
+    } catch (_) {
       if (!mounted) return;
       setState(() => _isFetchingRoute = false);
       _showSnackBar('No se pudo calcular la ruta entre los puntos.');
     }
   }
 
-  /// Restablece la selección de origen y destino.
   void _clearRoute() {
     setState(() {
       _origin = null;
@@ -159,25 +140,14 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
       _routeDistanceKm = null;
       _routeDurationMin = null;
     });
-    if (_currentLocation != null) {
-      _mapController.move(_currentLocation!, 15.0);
-    }
   }
 
-  /// Centra el mapa en la posición actual del GPS.
   void _recenterToCurrentLocation() {
     if (_currentLocation != null) {
       _mapController.move(_currentLocation!, 15.0);
-    } else {
-      _initLocation();
+      return;
     }
-  }
-
-  void _showSnackBar(String text) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(text), duration: const Duration(seconds: 3)),
-    );
+    _initLocation();
   }
 
   @override
@@ -190,7 +160,7 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
         actions: [
           IconButton(
             icon: const Icon(Icons.my_location),
-            tooltip: 'Probar GPS',
+            tooltip: 'Mi Ubicación',
             onPressed: _initLocation,
           ),
           IconButton(
@@ -263,29 +233,6 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
               ),
             ],
           ),
-
-          // Indicador de estado de carga inicial de GPS
-          if (_isLoadingLocation)
-            Container(
-              color: Colors.black26,
-              child: const Center(
-                child: Card(
-                  child: Padding(
-                    padding: EdgeInsets.all(16.0),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        CircularProgressIndicator(),
-                        SizedBox(width: 16),
-                        Text('Obteniendo ubicación...'),
-                      ],
-                    ),
-                  ),
-                ),
-              ),
-            ),
-
-          // Indicador de estado de carga de la ruta
           if (_isFetchingRoute)
             const Positioned(
               top: 16,
@@ -293,7 +240,10 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
               right: 16,
               child: Card(
                 child: Padding(
-                  padding: EdgeInsets.symmetric(vertical: 12.0, horizontal: 16.0),
+                  padding: EdgeInsets.symmetric(
+                    vertical: 12.0,
+                    horizontal: 16.0,
+                  ),
                   child: Row(
                     children: [
                       SizedBox(
@@ -308,9 +258,9 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
                 ),
               ),
             ),
-
-          // Card informativo con distancia y duración estimada
-          if (_routeDistanceKm != null && _routeDurationMin != null && !_isFetchingRoute)
+          if (_routeDistanceKm != null &&
+              _routeDurationMin != null &&
+              !_isFetchingRoute)
             Positioned(
               top: 16,
               left: 16,

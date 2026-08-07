@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
@@ -41,37 +42,40 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
   Future<void> _initLocation() async {
     setState(() => _isLoadingLocation = true);
 
-    final bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
-    if (!serviceEnabled) {
-      _showSnackBar('GPS apagado: activa los servicios de ubicación.');
-      await Geolocator.openLocationSettings();
-      _useFallbackLocation();
-      return;
-    }
-
-    LocationPermission permission = await Geolocator.checkPermission();
-    if (permission == LocationPermission.denied) {
-      permission = await Geolocator.requestPermission();
-      if (permission == LocationPermission.denied) {
-        _showSnackBar('Permiso de ubicación denegado por el usuario.');
+    try {
+      final bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        _showSnackBar('GPS apagado: activa los servicios de ubicación.');
+        unawaited(Geolocator.openLocationSettings());
         _useFallbackLocation();
         return;
       }
-    }
 
-    if (permission == LocationPermission.deniedForever) {
-      _showSnackBar('Permiso denegado permanentemente. Redirigiendo a Ajustes...');
-      await Geolocator.openAppSettings();
-      _useFallbackLocation();
-      return;
-    }
+      LocationPermission permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+        if (permission == LocationPermission.denied) {
+          _showSnackBar('Permiso de ubicación denegado por el usuario.');
+          _useFallbackLocation();
+          return;
+        }
+      }
 
-    try {
-      final position = await Geolocator.getCurrentPosition(
+      if (permission == LocationPermission.deniedForever) {
+        _showSnackBar('Permiso denegado permanentemente. Ve a Ajustes.');
+        unawaited(Geolocator.openAppSettings());
+        _useFallbackLocation();
+        return;
+      }
+
+      Position? position = await Geolocator.getLastKnownPosition();
+      position ??= await Geolocator.getCurrentPosition(
         locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.high,
+          accuracy: LocationAccuracy.low,
+          timeLimit: Duration(seconds: 5),
         ),
       );
+
       final userLatLng = LatLng(position.latitude, position.longitude);
       debugPrint('UBICACIÓN REAL ENCONTRADA: ${position.latitude}, ${position.longitude}');
 

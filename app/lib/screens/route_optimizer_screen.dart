@@ -5,10 +5,18 @@ import 'package:geolocator/geolocator.dart';
 
 import '../services/routing_service.dart';
 
-/// Pantalla que muestra un mapa interactivo (OpenStreetMap vía flutter_map).
-/// Al abrir, obtiene la ubicación GPS del usuario y la fija como Origen.
-/// El usuario toca el mapa para marcar el Destino; en cuanto existen
-/// ambos puntos, se calcula automáticamente la ruta con OSRM.
+/// Pantalla de optimización de rutas.
+///
+/// Flujo:
+/// 1. Al abrir, solicita permisos de GPS y centra el mapa en la
+///    ubicación actual del usuario.
+/// 2. El usuario toca el mapa:
+///    - Sin origen -> el toque fija el Origen.
+///    - Con origen y sin destino -> el toque fija el Destino y
+///      dispara el cálculo de ruta con OSRM.
+///    - Con origen y destino -> el toque reinicia la selección
+///      (limpia todo) y no fija nada hasta el siguiente toque.
+/// 3. Botones: "Usar mi ubicación actual como Origen" y "Limpiar selección".
 class RouteOptimizerScreen extends StatefulWidget {
   const RouteOptimizerScreen({super.key});
 
@@ -20,35 +28,47 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
   final RoutingService _routingService = RoutingService();
   final MapController _mapController = MapController();
 
-  // Puntos seleccionados.
+  // Puntos seleccionados por el usuario.
   LatLng? _origin;
   LatLng? _destination;
 
-  // Puntos de la ruta calculada (para dibujar la Polyline).
+  // Ruta calculada.
   List<LatLng> _routePoints = [];
   RouteResult? _routeResult;
 
-  // Estados de carga independientes para GPS y para el cálculo de ruta.
+  // Última posición GPS conocida (para el botón "usar mi ubicación").
+  LatLng? _currentUserLocation;
+
+  // Estados de carga.
   bool _isLocating = true;
   bool _isRoutingLoading = false;
 
+  // Flag para saber si el mapa ya terminó su primer frame
+  // (evita mover la cámara antes de que esté listo).
+  bool _mapReady = false;
+
   String? _errorMessage;
 
-  // Centro por defecto (fallback) si no se puede obtener el GPS.
   static const LatLng _fallbackCenter = LatLng(19.4326, -99.1332); // CDMX
 
   @override
   void initState() {
     super.initState();
-    _initLocation();
+    // Se ejecuta después de que el primer frame se haya renderizado,
+    // garantizando que el MapController ya esté "attached" al widget
+    // FlutterMap antes de intentar mover la cámara.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _mapReady = true;
+      _initLocation();
+    });
   }
 
   // ---------------------------------------------------------------------
   // Geolocalización
   // ---------------------------------------------------------------------
 
-  /// Solicita permisos de ubicación, obtiene la posición actual del
-  /// usuario y la establece como punto de Origen, centrando el mapa.
+  /// Solicita permisos de ubicación y obtiene la posición actual,
+  /// centrando el mapa y fijándola como Origen si aún no hay uno.
   Future<void> _initLocation() async {
     setState(() {
       _isLocating = true;
@@ -56,14 +76,17 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
     });
 
     try {
-      final position = await _determinePosition();
+      final position = await _requestLocationAndGetPosition();
       final userLocation = LatLng(position.latitude, position.longitude);
 
       setState(() {
-        _origin = userLocation;
+        _currentUserLocation = userLocation;
+        // Solo fijamos el origen automáticamente si el usuario aún
+        // no ha marcado nada manualmente en el mapa.
+        _origin ??= userLocation;
       });
 
-      _mapController.move(userLocation, 16);
+      _moveMapSafely(userLocation, 16);
     } on LocationPermissionException catch (e) {
       _showPermissionSnackBar(e.message);
     } catch (e) {
@@ -77,39 +100,37 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
     }
   }
 
-  /// Verifica servicio de ubicación y permisos, y devuelve la posición
-  /// actual del dispositivo. Lanza [LocationPermissionException] si
-  /// el usuario deniega el permiso.
-  Future<Position> _determinePosition() async {
-    // 1. Verifica que el servicio de ubicación esté activo (GPS encendido).
+  /// Paso a paso: verifica servicio de ubicación activo, solicita
+  /// el permiso explícitamente con requestPermission(), y luego
+  /// obtiene la posición actual con getCurrentPosition().
+  Future<Position> _requestLocationAndGetPosition() async {
+    // 1. ¿Está el servicio de ubicación (GPS) encendido en el dispositivo?
     final serviceEnabled = await Geolocator.isLocationServiceEnabled();
     if (!serviceEnabled) {
       throw LocationPermissionException(
-        'El servicio de ubicación está desactivado. Actívalo para continuar.',
+        'El GPS está desactivado. Actívalo en la configuración del dispositivo.',
       );
     }
 
-    // 2. Verifica el estado actual del permiso.
-    LocationPermission permission = await Geolocator.checkPermission();
+    // 2. Solicita el permiso de forma explícita (dispara el diálogo
+    // nativo de Android/iOS si aún no se ha concedido).
+    LocationPermission permission = await Geolocator.requestPermission();
 
     if (permission == LocationPermission.denied) {
-      // Solicita el permiso al usuario.
-      permission = await Geolocator.requestPermission();
-      if (permission == LocationPermission.denied) {
-        throw LocationPermissionException(
-          'Permiso de ubicación denegado. No se puede centrar el mapa en tu posición.',
-        );
-      }
+      throw LocationPermissionException(
+        'Permiso de ubicación denegado. No se puede centrar el mapa en tu posición.',
+      );
     }
 
     if (permission == LocationPermission.deniedForever) {
       throw LocationPermissionException(
         'El permiso de ubicación fue denegado permanentemente. '
-        'Habilítalo desde la configuración de la app.',
+        'Habilítalo manualmente desde los ajustes de la app.',
       );
     }
 
-    // 3. Obtiene la posición actual con buena precisión.
+    // 3. Ya con permiso concedido (whileInUse o always), obtenemos
+    // la posición actual del dispositivo.
     return Geolocator.getCurrentPosition(
       locationSettings: const LocationSettings(
         accuracy: LocationAccuracy.high,
@@ -117,14 +138,24 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
     );
   }
 
-  /// Muestra un SnackBar explicando el motivo por el que no se
-  /// pudo acceder a la ubicación.
+  /// Mueve la cámara del mapa solo si el controller ya está listo
+  /// (evita excepciones o congelamientos si se llama demasiado pronto).
+  void _moveMapSafely(LatLng target, double zoom) {
+    if (!_mapReady) return;
+    try {
+      _mapController.move(target, zoom);
+    } catch (_) {
+      // Si el controller aún no está attached, se ignora silenciosamente;
+      // el usuario puede recentrar manualmente con el FAB.
+    }
+  }
+
   void _showPermissionSnackBar(String message) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(message),
-        duration: const Duration(seconds: 4),
+        duration: const Duration(seconds: 5),
         action: SnackBarAction(
           label: 'Reintentar',
           onPressed: _initLocation,
@@ -133,56 +164,71 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
     );
   }
 
-  /// Vuelve a centrar el mapa en la ubicación actual (botón FAB).
-  Future<void> _recenterOnUser() async {
-    if (_origin != null && !_isLocating) {
-      // Si ya tenemos una ubicación previa, simplemente re-centramos.
-      _mapController.move(_origin!, 16);
-      return;
+  /// Botón: "Usar mi ubicación actual como Origen".
+  /// Si ya tenemos una posición GPS conocida, la usa directamente;
+  /// si no, la solicita de nuevo.
+  Future<void> _useCurrentLocationAsOrigin() async {
+    if (_currentUserLocation == null) {
+      await _initLocation();
+      if (_currentUserLocation == null) return; // no se pudo obtener
     }
-    await _initLocation();
+
+    setState(() {
+      _origin = _currentUserLocation;
+      _destination = null;
+      _routePoints = [];
+      _routeResult = null;
+      _errorMessage = null;
+    });
+
+    _moveMapSafely(_currentUserLocation!, 16);
   }
 
   // ---------------------------------------------------------------------
   // Interacción con el mapa (toques)
   // ---------------------------------------------------------------------
 
-  /// Maneja el toque sobre el mapa:
-  /// - Si no hay destino aún -> este toque define el Destino.
-  /// - Si ya existen origen y destino -> se reinicia la selección y
-  ///   este toque se convierte en el nuevo Origen.
+  /// Maneja el toque sobre el mapa según las 3 reglas solicitadas.
   void _handleMapTap(TapPosition tapPosition, LatLng point) {
     setState(() {
       _errorMessage = null;
 
-      if (_origin != null && _destination != null) {
-        // Ya había una ruta completa: reiniciamos con un nuevo origen.
+      if (_origin == null) {
+        // Regla 1: no hay origen -> este toque lo fija.
         _origin = point;
+      } else if (_destination == null) {
+        // Regla 2: hay origen pero no destino -> este toque fija destino
+        // y se dispara el cálculo de ruta (fuera del setState).
+        _destination = point;
+      } else {
+        // Regla 3: ya existen ambos -> se reinicia la selección.
+        _origin = null;
         _destination = null;
         _routePoints = [];
         _routeResult = null;
-      } else if (_origin == null) {
-        // No debería pasar normalmente (el GPS ya define el origen),
-        // pero se contempla como fallback si el usuario no dio permiso.
-        _origin = point;
-      } else {
-        // Origen ya existe, destino aún no: este toque lo define.
-        _destination = point;
       }
     });
 
-    // Si tras este toque ya tenemos ambos puntos, calculamos la ruta.
-    if (_origin != null && _destination != null) {
+    if (_origin != null && _destination != null && _routePoints.isEmpty) {
       _calculateRoute();
     }
+  }
+
+  /// Botón: "Limpiar selección".
+  void _clearSelection() {
+    setState(() {
+      _origin = null;
+      _destination = null;
+      _routePoints = [];
+      _routeResult = null;
+      _errorMessage = null;
+    });
   }
 
   // ---------------------------------------------------------------------
   // Cálculo de ruta (OSRM)
   // ---------------------------------------------------------------------
 
-  /// Consulta la ruta más corta entre origen y destino usando
-  /// RoutingService, y actualiza la Polyline y el resultado en pantalla.
   Future<void> _calculateRoute() async {
     if (_origin == null || _destination == null) return;
 
@@ -236,8 +282,6 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final mapCenter = _origin ?? _fallbackCenter;
-
     return Scaffold(
       appBar: AppBar(
         title: const Text('Optimizador de Rutas'),
@@ -248,8 +292,8 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
           FlutterMap(
             mapController: _mapController,
             options: MapOptions(
-              initialCenter: mapCenter,
-              initialZoom: 14,
+              initialCenter: _fallbackCenter,
+              initialZoom: 12,
               onTap: _handleMapTap,
             ),
             children: [
@@ -258,7 +302,6 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
                 userAgentPackageName: 'com.example.flutter_sensors_maps',
               ),
 
-              // Polyline con la ruta calculada por OSRM.
               if (_routePoints.isNotEmpty)
                 PolylineLayer(
                   polylines: [
@@ -270,7 +313,6 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
                   ],
                 ),
 
-              // Marcadores de origen y destino.
               MarkerLayer(
                 markers: [
                   if (_origin != null)
@@ -279,7 +321,7 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
                       width: 44,
                       height: 44,
                       child: const Icon(
-                        Icons.my_location,
+                        Icons.trip_origin,
                         color: Colors.blue,
                         size: 32,
                       ),
@@ -300,7 +342,7 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
             ],
           ),
 
-          // Barra de instrucciones (superior).
+          // Banner superior con instrucciones dinámicas.
           Positioned(
             top: 12,
             left: 12,
@@ -312,40 +354,88 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
             ),
           ),
 
-          // Indicador de carga centrado (GPS o cálculo de ruta).
+          // Indicador de carga (GPS o cálculo de ruta).
           if (_isLocating || _isRoutingLoading)
             const Positioned.fill(
               child: IgnorePointer(
-                child: Center(
-                  child: _LoadingBadge(),
-                ),
+                child: Center(child: _LoadingBadge()),
               ),
             ),
 
-          // Mensaje de error (banner inferior, sobre el panel de resultados).
+          // Banner de error.
           if (_errorMessage != null)
             Positioned(
-              bottom: _routeResult != null ? 100 : 16,
+              bottom: _routeResult != null ? 170 : 90,
               left: 16,
               right: 16,
               child: _ErrorBanner(message: _errorMessage!),
             ),
 
-          // Tarjeta flotante con distancia y tiempo estimado.
+          // Tarjeta con distancia y tiempo estimado.
           if (_routeResult != null)
             Positioned(
-              bottom: 16,
+              bottom: 90,
               left: 16,
               right: 16,
               child: _RouteInfoCard(result: _routeResult!),
             ),
+
+          // Barra inferior con los botones de acción.
+          Positioned(
+            bottom: 16,
+            left: 16,
+            right: 16,
+            child: Row(
+              children: [
+                Expanded(
+                  child: ElevatedButton.icon(
+                    onPressed: _isLocating ? null : _useCurrentLocationAsOrigin,
+                    icon: const Icon(Icons.my_location, size: 18),
+                    label: const Text('Usar mi ubicación'),
+                    style: ElevatedButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: (_origin != null || _destination != null)
+                        ? _clearSelection
+                        : null,
+                    icon: const Icon(Icons.clear, size: 18),
+                    label: const Text('Limpiar selección'),
+                    style: OutlinedButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
         ],
       ),
-      // FAB para volver a centrar el mapa en la ubicación actual.
       floatingActionButton: FloatingActionButton(
-        onPressed: _recenterOnUser,
+        onPressed: _isLocating
+            ? null
+            : () {
+                if (_currentUserLocation != null) {
+                  _moveMapSafely(_currentUserLocation!, 16);
+                } else {
+                  _initLocation();
+                }
+              },
         tooltip: 'Centrar en mi ubicación',
-        child: const Icon(Icons.my_location),
+        child: _isLocating
+            ? const SizedBox(
+                width: 20,
+                height: 20,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  color: Colors.white,
+                ),
+              )
+            : const Icon(Icons.center_focus_strong),
       ),
     );
   }
@@ -355,8 +445,6 @@ class _RouteOptimizerScreenState extends State<RouteOptimizerScreen> {
 // Excepciones
 // ---------------------------------------------------------------------
 
-/// Excepción lanzada cuando el usuario deniega el permiso de ubicación
-/// o el servicio de ubicación está desactivado.
 class LocationPermissionException implements Exception {
   final String message;
   LocationPermissionException(this.message);
@@ -366,8 +454,6 @@ class LocationPermissionException implements Exception {
 // Widgets auxiliares de UI
 // ---------------------------------------------------------------------
 
-/// Banner superior que informa el estado actual del flujo
-/// (buscando ubicación, esperando destino, ruta lista).
 class _InstructionBanner extends StatelessWidget {
   final bool isLocating;
   final bool hasOrigin;
@@ -386,7 +472,7 @@ class _InstructionBanner extends StatelessWidget {
     Color color;
 
     if (isLocating) {
-      message = 'Obteniendo tu ubicación actual...';
+      message = 'Solicitando permiso y obteniendo tu ubicación...';
       icon = Icons.gps_fixed;
       color = Colors.blueGrey;
     } else if (!hasOrigin) {
@@ -398,7 +484,7 @@ class _InstructionBanner extends StatelessWidget {
       icon = Icons.flag;
       color = Colors.red;
     } else {
-      message = 'Ruta calculada. Toca de nuevo para elegir un nuevo origen.';
+      message = 'Ruta trazada. Toca de nuevo para reiniciar la selección.';
       icon = Icons.check_circle;
       color = Colors.green;
     }
@@ -426,8 +512,6 @@ class _InstructionBanner extends StatelessWidget {
   }
 }
 
-/// Insignia de carga centrada, usada tanto para el GPS como
-/// para el cálculo de la ruta.
 class _LoadingBadge extends StatelessWidget {
   const _LoadingBadge();
 
@@ -447,7 +531,6 @@ class _LoadingBadge extends StatelessWidget {
   }
 }
 
-/// Banner de error mostrado sobre el mapa.
 class _ErrorBanner extends StatelessWidget {
   final String message;
 
@@ -466,10 +549,7 @@ class _ErrorBanner extends StatelessWidget {
             const Icon(Icons.error_outline, color: Colors.red, size: 20),
             const SizedBox(width: 8),
             Expanded(
-              child: Text(
-                message,
-                style: const TextStyle(color: Colors.red),
-              ),
+              child: Text(message, style: const TextStyle(color: Colors.red)),
             ),
           ],
         ),
@@ -478,8 +558,6 @@ class _ErrorBanner extends StatelessWidget {
   }
 }
 
-/// Tarjeta flotante inferior con la distancia y el tiempo estimado
-/// de la ruta calculada.
 class _RouteInfoCard extends StatelessWidget {
   final RouteResult result;
 
@@ -501,11 +579,7 @@ class _RouteInfoCard extends StatelessWidget {
               value: '${result.distanceKm.toStringAsFixed(2)} km',
               label: 'Distancia',
             ),
-            Container(
-              width: 1,
-              height: 36,
-              color: Colors.grey.shade300,
-            ),
+            Container(width: 1, height: 36, color: Colors.grey.shade300),
             _InfoColumn(
               icon: Icons.access_time,
               value: '${result.durationMinutes.toStringAsFixed(0)} min',
@@ -535,14 +609,8 @@ class _InfoColumn extends StatelessWidget {
       children: [
         Icon(icon, color: Colors.blueAccent, size: 22),
         const SizedBox(height: 4),
-        Text(
-          value,
-          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-        ),
-        Text(
-          label,
-          style: const TextStyle(fontSize: 12, color: Colors.grey),
-        ),
+        Text(value, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+        Text(label, style: const TextStyle(fontSize: 12, color: Colors.grey)),
       ],
     );
   }
